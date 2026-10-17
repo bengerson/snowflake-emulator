@@ -62,23 +62,30 @@ func (h *QueryHandler) ExecuteQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert parameter bindings sent by the driver
+	bindings, err := convertQueryRequestBindings(req.Bindings)
+	if err != nil {
+		sendError(w, apierror.NewSnowflakeError(apierror.CodeInvalidParameter, err.Error()))
+		return
+	}
+
 	// Classify the SQL statement
 	classification := query.ClassifySQL(req.SQLText)
 
 	if classification.IsQuery {
-		h.executeQuery(w, ctx, sessionID, req.SQLText)
+		h.executeQuery(w, ctx, sessionID, req.SQLText, bindings)
 	} else {
-		h.executeDML(w, ctx, sessionID, req.SQLText)
+		h.executeDML(w, ctx, sessionID, req.SQLText, bindings)
 	}
 }
 
 // executeQuery executes a SELECT query with gosnowflake protocol.
-func (h *QueryHandler) executeQuery(w http.ResponseWriter, ctx context.Context, sessionID int64, sqlText string) { //nolint:revive // context-as-argument: keeping w first for handler consistency
+func (h *QueryHandler) executeQuery(w http.ResponseWriter, ctx context.Context, sessionID int64, sqlText string, bindings map[string]*query.BindingValue) { //nolint:revive // context-as-argument: keeping w first for handler consistency
 	// Generate unique query ID
 	queryID := generateQueryID()
 
-	// Execute query with history tracking
-	result, err := h.executor.QueryWithHistory(ctx, fmt.Sprintf("%d", sessionID), queryID, sqlText)
+	// Execute query with bindings and history tracking
+	result, err := h.executor.QueryWithBindingsAndHistory(ctx, fmt.Sprintf("%d", sessionID), queryID, sqlText, bindings)
 	if err != nil {
 		// Use apierror for error classification
 		// Include the underlying error in the message for debugging
@@ -113,12 +120,12 @@ func (h *QueryHandler) executeQuery(w http.ResponseWriter, ctx context.Context, 
 }
 
 // executeDML executes a DML/DDL statement with gosnowflake protocol.
-func (h *QueryHandler) executeDML(w http.ResponseWriter, ctx context.Context, sessionID int64, sqlText string) { //nolint:revive // context-as-argument: keeping w first for handler consistency
+func (h *QueryHandler) executeDML(w http.ResponseWriter, ctx context.Context, sessionID int64, sqlText string, bindings map[string]*query.BindingValue) { //nolint:revive // context-as-argument: keeping w first for handler consistency
 	// Generate unique query ID
 	queryID := generateQueryID()
 
-	// Execute with history tracking
-	result, err := h.executor.ExecuteWithHistory(ctx, fmt.Sprintf("%d", sessionID), queryID, sqlText)
+	// Execute with bindings and history tracking
+	result, err := h.executor.ExecuteWithBindingsAndHistory(ctx, fmt.Sprintf("%d", sessionID), queryID, sqlText, bindings)
 	if err != nil {
 		sendError(w, apierror.WrapError(apierror.CodeSQLExecutionError, "statement execution failed", err))
 		return
@@ -190,4 +197,38 @@ func convertRowsToStrings(rows [][]interface{}) [][]string {
 		result[i] = strRow
 	}
 	return result
+}
+
+// convertQueryRequestBindings converts query request bindings to query.BindingValue map.
+// Drivers send each binding as {"type": "TEXT", "value": "..."}; a null value binds SQL NULL.
+func convertQueryRequestBindings(bindings map[string]interface{}) (map[string]*query.BindingValue, error) {
+	if len(bindings) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[string]*query.BindingValue, len(bindings))
+	for key, raw := range bindings {
+		binding, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid binding %q: expected an object with type and value", key)
+		}
+
+		bindingType, _ := binding["type"].(string)
+		if bindingType == "" {
+			bindingType = query.TypeText
+		}
+
+		switch value := binding["value"].(type) {
+		case nil:
+			result[key] = &query.BindingValue{Type: query.ValueNull}
+		case string:
+			result[key] = &query.BindingValue{Type: bindingType, Value: value}
+		case float64, bool:
+			result[key] = &query.BindingValue{Type: bindingType, Value: fmt.Sprint(value)}
+		default:
+			// Array bindings (multi-row inserts) are not supported yet
+			return nil, fmt.Errorf("unsupported value for binding %q: %T", key, value)
+		}
+	}
+	return result, nil
 }

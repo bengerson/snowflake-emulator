@@ -426,6 +426,33 @@ func TestExecutor_QueryWithBindings(t *testing.T) {
 			bindings:     map[string]*QueryBindingValue{},
 			expectedRows: 1,
 		},
+		{
+			name: "VPrefixedPlaceholders",
+			sql:  "SELECT :v1 AS a, :v2 AS b",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "foo"},
+				"2": {Type: "FIXED", Value: "2"},
+			},
+			expectedRows: 1,
+			checkValue: func(t *testing.T, rows [][]interface{}) {
+				if rows[0][0] != "foo" {
+					t.Errorf("Expected 'foo', got %v", rows[0][0])
+				}
+			},
+		},
+		{
+			name: "NullBinding",
+			sql:  "SELECT :1 AS v",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "NULL"},
+			},
+			expectedRows: 1,
+			checkValue: func(t *testing.T, rows [][]interface{}) {
+				if rows[0][0] != nil {
+					t.Errorf("Expected NULL, got %v", rows[0][0])
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -686,6 +713,145 @@ func TestTransactionClassifier(t *testing.T) {
 			}
 			if got := IsRollback(tt.sql); got != tt.isRollback {
 				t.Errorf("IsRollback(%q) = %v, want %v", tt.sql, got, tt.isRollback)
+			}
+		})
+	}
+}
+
+// TestExecutor_ApplyBindings tests placeholder and binding key formats.
+func TestExecutor_ApplyBindings(t *testing.T) {
+	executor := &Executor{}
+
+	tests := []struct {
+		name     string
+		sql      string
+		bindings map[string]*QueryBindingValue
+		expected string
+		wantErr  bool
+	}{
+		{
+			name: "NumericPlaceholders",
+			sql:  "SELECT * FROM t WHERE a = :1 AND b = :2",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "foo"},
+				"2": {Type: "FIXED", Value: "2"},
+			},
+			expected: "SELECT * FROM t WHERE a = 'foo' AND b = 2",
+		},
+		{
+			name: "VPrefixedPlaceholders",
+			sql:  "SELECT * FROM t WHERE a = :v1 AND b = :V2",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "foo"},
+				"2": {Type: "TEXT", Value: "bar"},
+			},
+			expected: "SELECT * FROM t WHERE a = 'foo' AND b = 'bar'",
+		},
+		{
+			name: "VPrefixedKeys",
+			sql:  "SELECT * FROM t WHERE a = :v1 AND b = :v2",
+			bindings: map[string]*QueryBindingValue{
+				"v1": {Type: "TEXT", Value: "foo"},
+				"v2": {Type: "TEXT", Value: "bar"},
+			},
+			expected: "SELECT * FROM t WHERE a = 'foo' AND b = 'bar'",
+		},
+		{
+			name: "TenOrMoreBindings",
+			sql:  "SELECT :v1, :v10, :1, :10",
+			bindings: map[string]*QueryBindingValue{
+				"1":  {Type: "FIXED", Value: "1"},
+				"10": {Type: "FIXED", Value: "10"},
+			},
+			expected: "SELECT 1, 10, 1, 10",
+		},
+		{
+			name: "QuestionMarkPlaceholders",
+			sql:  "SELECT * FROM t WHERE a = ? AND b = ?",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "foo"},
+				"2": {Type: "FIXED", Value: "2"},
+			},
+			expected: "SELECT * FROM t WHERE a = 'foo' AND b = 2",
+		},
+		{
+			name: "ValueContainingPlaceholder",
+			sql:  "SELECT :1 AS a, :2 AS b",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "x"},
+				"2": {Type: "TEXT", Value: "10:15"},
+			},
+			expected: "SELECT 'x' AS a, '10:15' AS b",
+		},
+		{
+			name: "ValueNotInterpretedAsSQL",
+			sql:  "SELECT :v1 AS a, :v2 AS b",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: ") OR 1=1 --"},
+				"2": {Type: "TEXT", Value: "a:v1b"},
+			},
+			expected: "SELECT ') OR 1=1 --' AS a, 'a:v1b' AS b",
+		},
+		{
+			name: "QuestionMarkInValue",
+			sql:  "SELECT ? AS a, ? AS b",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "what?"},
+				"2": {Type: "TEXT", Value: "y"},
+			},
+			expected: "SELECT 'what?' AS a, 'y' AS b",
+		},
+		{
+			name: "PlaceholdersInLiteralsAndComments",
+			sql:  "SELECT ':1', '?', \":1\", :1 /* :1 ? */ -- ?",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "TEXT", Value: "x"},
+			},
+			expected: "SELECT ':1', '?', \":1\", 'x' /* :1 ? */ -- ?",
+		},
+		{
+			name: "CastIsNotPlaceholder",
+			sql:  "SELECT :1::INTEGER, ?::VARCHAR",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "FIXED", Value: "5"},
+			},
+			expected: "SELECT 5::INTEGER, 5::VARCHAR",
+		},
+		{
+			name: "UnboundPlaceholderKept",
+			sql:  "SELECT :1, :10",
+			bindings: map[string]*QueryBindingValue{
+				"1": {Type: "FIXED", Value: "1"},
+			},
+			expected: "SELECT 1, :10",
+		},
+		{
+			name: "DuplicateKeys",
+			sql:  "SELECT :1",
+			bindings: map[string]*QueryBindingValue{
+				"1":  {Type: "TEXT", Value: "a"},
+				"v1": {Type: "TEXT", Value: "b"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "NamedKeyNotSupported",
+			sql:  "SELECT :name",
+			bindings: map[string]*QueryBindingValue{
+				"name": {Type: "TEXT", Value: "foo"},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := executor.applyBindings(tt.sql, tt.bindings)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("applyBindings() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.expected {
+				t.Errorf("applyBindings() = %q, want %q", got, tt.expected)
 			}
 		})
 	}
