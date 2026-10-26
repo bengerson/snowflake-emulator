@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/blastrain/vitess-sqlparser/sqlparser"
@@ -107,6 +108,9 @@ func (t *Translator) Translate(sql string) (string, error) {
 	// including multi-statement batches, gets its types translated.
 	sql = translateTypes(sql)
 
+	// Rewrite TABLE(FLATTEN(PARSE_JSON(x))) before parsing: vitess-sqlparser cannot parse it.
+	sql = rewriteFlattenJSON(sql)
+
 	// Skip AST transformation for DDL statements - they don't need function translation
 	// and the sqlparser adds unwanted backticks when serializing back to string
 	// Also skip SHOW/DESCRIBE/EXPLAIN which cause vitess-sqlparser to panic
@@ -155,6 +159,37 @@ func (t *Translator) Translate(sql string) (string, error) {
 	result = t.handleComplexTransformations(result)
 
 	return result, nil
+}
+
+var (
+	// TABLE(FLATTEN(PARSE_JSON(x))) or TABLE(FLATTEN(INPUT => PARSE_JSON(x))) where x is a bind
+	// marker, a named parameter or a string literal (anything without parentheses).
+	flattenJSONPattern = regexp.MustCompile(`(?is)TABLE\s*\(\s*FLATTEN\s*\(\s*(?:INPUT\s*=>\s*)?PARSE_JSON\s*\(\s*([^()]*?)\s*\)\s*\)\s*\)`)
+	// alias.value[n] or value[n]: the element accessor of a FLATTEN row.
+	flattenValuePattern = regexp.MustCompile(`(?i)\b(?:(\w+)\.)?value\s*\[\s*(\d+)\s*\]`)
+)
+
+// rewriteFlattenJSON translates TABLE(FLATTEN(PARSE_JSON(x))) over a JSON array into a DuckDB
+// subquery that exposes each element as the JSON column "value", and value[n] into the text
+// accessor value->>n. DuckDB has no table-function call syntax, so the rewrite runs on the SQL
+// text before parsing. JSON indexing is 0-based like Snowflake's, which is why the elements stay
+// JSON rather than becoming a DuckDB list (1-based); ->> yields the element as text, whereas
+// value[n] would keep the JSON quotes and fail to compare with string literals. The CAST keeps
+// the rewrite free of double quotes, which the parser would otherwise escape inside the literal.
+func rewriteFlattenJSON(sql string) string {
+	if !flattenJSONPattern.MatchString(sql) {
+		return sql
+	}
+
+	sql = flattenJSONPattern.ReplaceAllString(sql, "(SELECT unnest(CAST($1 AS JSON[])) AS value)")
+
+	return flattenValuePattern.ReplaceAllStringFunc(sql, func(match string) string {
+		groups := flattenValuePattern.FindStringSubmatch(match)
+		if groups[1] == "" {
+			return "(value->>" + groups[2] + ")"
+		}
+		return "(" + groups[1] + ".value->>" + groups[2] + ")"
+	})
 }
 
 // handleComplexTransformations handles transformations that require more than simple renames.
