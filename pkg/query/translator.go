@@ -108,7 +108,9 @@ func (t *Translator) Translate(sql string) (string, error) {
 	// including multi-statement batches, gets its types translated.
 	sql = translateTypes(sql)
 
-	// Rewrite TABLE(FLATTEN(PARSE_JSON(x))) before parsing: vitess-sqlparser cannot parse it.
+	// Rewrite functions and TABLE(FLATTEN(PARSE_JSON(x))) on the text before parsing, so that
+	// statements vitess-sqlparser cannot parse are translated too.
+	sql = translateFunctions(sql)
 	sql = rewriteFlattenJSON(sql)
 
 	// Skip AST transformation for DDL statements - they don't need function translation
@@ -129,10 +131,10 @@ func (t *Translator) Translate(sql string) (string, error) {
 	// Parse the SQL statement into an AST
 	stmt, err := sqlparser.Parse(sql)
 	if err != nil {
-		// If parsing fails, return original SQL
+		// If parsing fails, return the SQL with only the text-level function renames applied.
 		// DuckDB might handle some Snowflake syntax directly
 		// This provides graceful degradation for unsupported syntax
-		return sql, nil
+		return translatePassthroughFunctions(sql), nil
 	}
 
 	// Walk the AST and transform functions in-place
@@ -167,6 +169,8 @@ var (
 	flattenJSONPattern = regexp.MustCompile(`(?is)TABLE\s*\(\s*FLATTEN\s*\(\s*(?:INPUT\s*=>\s*)?PARSE_JSON\s*\(\s*([^()]*?)\s*\)\s*\)\s*\)`)
 	// alias.value[n] or value[n]: the element accessor of a FLATTEN row.
 	flattenValuePattern = regexp.MustCompile(`(?i)\b(?:(\w+)\.)?value\s*\[\s*(\d+)\s*\]`)
+	// alias.value::STRING or value::STRING: the whole element of a flat array as text.
+	flattenValueTextPattern = regexp.MustCompile(`(?i)\b(?:(\w+)\.)?value::(?:STRING|VARCHAR|TEXT)\b`)
 )
 
 // rewriteFlattenJSON translates TABLE(FLATTEN(PARSE_JSON(x))) over a JSON array into a DuckDB
@@ -183,13 +187,22 @@ func rewriteFlattenJSON(sql string) string {
 
 	sql = flattenJSONPattern.ReplaceAllString(sql, "(SELECT unnest(CAST($1 AS JSON[])) AS value)")
 
-	return flattenValuePattern.ReplaceAllStringFunc(sql, func(match string) string {
+	sql = flattenValuePattern.ReplaceAllStringFunc(sql, func(match string) string {
 		groups := flattenValuePattern.FindStringSubmatch(match)
-		if groups[1] == "" {
-			return "(value->>" + groups[2] + ")"
-		}
-		return "(" + groups[1] + ".value->>" + groups[2] + ")"
+		return flattenAccessor(groups[1], groups[2])
 	})
+
+	return flattenValueTextPattern.ReplaceAllStringFunc(sql, func(match string) string {
+		groups := flattenValueTextPattern.FindStringSubmatch(match)
+		return flattenAccessor(groups[1], "'$'")
+	})
+}
+
+func flattenAccessor(alias, path string) string {
+	if alias == "" {
+		return "(value->>" + path + ")"
+	}
+	return "(" + alias + ".value->>" + path + ")"
 }
 
 // handleComplexTransformations handles transformations that require more than simple renames.

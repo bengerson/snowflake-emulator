@@ -767,8 +767,8 @@ func TestTranslator_FLATTEN(t *testing.T) {
 
 // TestTranslator_FlattenParseJSON tests the text rewrite of TABLE(FLATTEN(PARSE_JSON(x))) and
 // value[n] into a DuckDB subquery over a JSON[] cast and the ->> accessor. vitess-sqlparser cannot
-// parse the rewritten statement (JSON[] type, ->>), so the rest of it passes through untouched
-// (the AST path would otherwise mangle DATEDIFF('second', x, y) and bind markers).
+// parse the rewritten statement (JSON[] type, ->>), so the rest of it passes through with only
+// the text-level function rules applied (the AST path would otherwise mangle bind markers).
 func TestTranslator_FlattenParseJSON(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -801,12 +801,17 @@ SELECT DATEDIFF('second', e."TIMESTAMP", a."TIMESTAMP") FROM events e JOIN conta
   SELECT (c.value->>0)::VARCHAR AS contact_id, (c.value->>1)::VARCHAR AS client_id
   FROM (SELECT unnest(CAST(? AS JSON[])) AS value) c
 )
-SELECT DATEDIFF('second', e."TIMESTAMP", a."TIMESTAMP") FROM events e JOIN contacts ON contacts.contact_id = e."CONTACT_ID"`,
+SELECT date_diff('second', e."TIMESTAMP", a."TIMESTAMP") FROM events e JOIN contacts ON contacts.contact_id = e."CONTACT_ID"`,
 		},
 		{
 			name:     "LowercaseAndWhitespace",
 			input:    `select f.value [ 2 ] from table ( flatten ( parse_json ( ? ) ) ) f`,
 			expected: `select (f.value->>2) from (SELECT unnest(CAST(? AS JSON[])) AS value) f`,
+		},
+		{
+			name:     "FlatArrayElementAsText",
+			input:    `SELECT f.value::STRING AS id FROM TABLE(FLATTEN(PARSE_JSON(?))) f WHERE value::STRING <> ''`,
+			expected: `SELECT (f.value->>'$') AS id FROM (SELECT unnest(CAST(? AS JSON[])) AS value) f WHERE (value->>'$') <> ''`,
 		},
 		{
 			name:     "ValueIndexWithoutFlattenIsUntouched",
@@ -1012,7 +1017,7 @@ func TestTranslator_ErrorCases(t *testing.T) {
 			name:             "UnbalancedParentheses_GracefulDegradation",
 			input:            "SELECT IFF(age > 18, 'adult' FROM users",
 			wantErr:          false,
-			expectedContains: "SELECT IFF(age > 18, 'adult' FROM users", // Returns original
+			expectedContains: "SELECT IF(age > 18, 'adult' FROM users", // Returns original with IFF renamed on the text
 		},
 		{
 			name:             "CompletelyInvalidSQL",
@@ -1100,7 +1105,7 @@ func TestTranslator_EdgeCases(t *testing.T) {
 		{
 			name:     "SubqueryWithFunctions",
 			input:    "SELECT * FROM (SELECT IFF(a, 1, 0) AS flag FROM test) WHERE flag = 1",
-			expected: "SELECT * FROM (SELECT IFF(a, 1, 0) AS flag FROM test) WHERE flag = 1", // Subquery parsing fails, returns original
+			expected: "SELECT * FROM (SELECT IF(a, 1, 0) AS flag FROM test) WHERE flag = 1", // Subquery parsing fails; IFF is renamed on the text
 			wantErr:  false,
 		},
 		{
