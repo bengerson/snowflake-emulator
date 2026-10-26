@@ -390,3 +390,33 @@ func TestRestAPIv2Handler_SubmitStatement_ResultShapeMatchesSQLAPI(t *testing.T)
 		t.Errorf("DML data[0][0] = %#v, want %q", got, "2")
 	}
 }
+
+func TestRestAPIv2Handler_SubmitStatement_ExecutionErrorReturns422(t *testing.T) {
+	_, router := setupRestAPIv2Handler(t)
+
+	body, _ := json.Marshal(types.SubmitStatementRequest{Statement: "SELECT * FROM no_such_table"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/statements", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Errorf("Expected status %d, got %d. Body: %s", http.StatusUnprocessableEntity, rr.Code, rr.Body.String())
+	}
+
+	var resp types.StatementResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+
+	if resp.SQLState != types.SQLState42000 {
+		t.Errorf("Expected SQLState %s, got %s", types.SQLState42000, resp.SQLState)
+	}
+	if resp.Message == "" {
+		t.Error("Expected error message to be set")
+	}
+	if resp.StatementHandle == "" {
+		t.Error("Expected statement handle to be set")
+	}
+}
