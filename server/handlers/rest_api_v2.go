@@ -218,7 +218,7 @@ func (h *RestAPIv2Handler) buildExecResponse(stmt *query.Statement, execResult *
 			},
 			PartitionInfo: []types.PartitionInfo{{RowCount: 1, UncompressedSize: int64(len(rowsAffected))}},
 		},
-		Data: [][]interface{}{{rowsAffected}},
+		Data: &[][]interface{}{{rowsAffected}},
 	}
 }
 
@@ -263,7 +263,7 @@ func (h *RestAPIv2Handler) buildStatementResponse(stmt *query.Statement, result 
 			RowType:       rowType,
 			PartitionInfo: []types.PartitionInfo{{RowCount: int64(len(result.Rows)), UncompressedSize: size}},
 		},
-		Data: data,
+		Data: &data,
 	}
 }
 

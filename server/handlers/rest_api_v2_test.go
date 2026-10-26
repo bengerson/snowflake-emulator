@@ -99,7 +99,7 @@ func TestRestAPIv2Handler_SubmitStatement_Sync(t *testing.T) {
 		t.Error("Expected ResultSetMetaData to be set")
 	}
 
-	if resp.Data == nil || len(resp.Data) == 0 {
+	if len(resp.Rows()) == 0 {
 		t.Error("Expected data to be returned")
 	}
 }
@@ -138,14 +138,14 @@ func TestRestAPIv2Handler_SubmitStatement_WithBindings(t *testing.T) {
 		t.Errorf("Expected code %s, got %s. Message: %s", types.ResponseCodeSuccess, resp.Code, resp.Message)
 	}
 
-	if resp.Data == nil || len(resp.Data) == 0 {
+	if len(resp.Rows()) == 0 {
 		t.Error("Expected data to be returned")
 		return
 	}
 
 	// Check that the values are correct
-	if len(resp.Data[0]) != 2 {
-		t.Errorf("Expected 2 columns, got %d", len(resp.Data[0]))
+	if len(resp.Rows()[0]) != 2 {
+		t.Errorf("Expected 2 columns, got %d", len(resp.Rows()[0]))
 	}
 }
 
@@ -418,5 +418,44 @@ func TestRestAPIv2Handler_SubmitStatement_ExecutionErrorReturns422(t *testing.T)
 	}
 	if resp.StatementHandle == "" {
 		t.Error("Expected statement handle to be set")
+	}
+}
+
+func TestRestAPIv2Handler_SubmitStatement_EmptyResultHasDataArray(t *testing.T) {
+	_, router := setupRestAPIv2Handler(t)
+
+	submit := func(statement string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(types.SubmitStatementRequest{Statement: statement})
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/statements", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		return rr
+	}
+
+	if rr := submit("CREATE TABLE empty_t (id INTEGER)"); rr.Code != http.StatusOK {
+		t.Fatalf("CREATE TABLE failed with status %d", rr.Code)
+	}
+
+	rr := submit("SELECT id FROM empty_t")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d. Body: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"data":[]`) {
+		t.Errorf("Expected an empty data array in the body, got: %s", rr.Body.String())
+	}
+
+	var resp types.StatementResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if resp.Data == nil || len(resp.Rows()) != 0 {
+		t.Errorf("Expected Data to be an empty slice, got %#v", resp.Data)
+	}
+
+	rr = submit("SELECT * FROM no_such_table")
+	if strings.Contains(rr.Body.String(), `"data"`) {
+		t.Errorf("Expected no data field in an error response, got: %s", rr.Body.String())
 	}
 }
